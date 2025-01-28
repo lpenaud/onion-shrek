@@ -1,0 +1,8 @@
+BACKGROUND=png:imgs/background/windows-xp-shrek.png
+ONION=imgs/onion-shrek-64x64.png
+RANGE_X=0:1400:40
+RANGE_Y=520:1400:40
+OUTPUTS=1,2,6
+OUTDIR=out
+
+2. imgs/others/Dragonne.png:360:360:890:0
