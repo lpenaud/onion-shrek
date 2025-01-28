@@ -1,150 +1,128 @@
-import { plant } from "./bliss.ts";
-import * as img from "./magick-image.ts";
-import { composite, convert } from "./magick.ts";
-import { type RangeOptions } from "./utils.ts";
-import * as cli from "jsr:@std/cli@1.0.11";
 import * as path from "jsr:@std/path@1.0.8";
+import { TextLineStream } from "jsr:@std/streams@1.0.8";
+import * as img from "./magick-image.ts";
+import { composite, convert, type MagickGeometry } from "./magick.ts";
+import { defaultRecord, range, RangeOptions } from "./utils.ts";
+import { plant } from "./bliss.ts";
+import * as SetNumber from "./set-number.ts";
 
-function parseImage(input: string | undefined): Promise<img.MagickImage> {
-  if (input === undefined) {
-    throw new Error("Undefined input");
-  }
-  const argRe = /^([a-z]+):/;
-  const match = argRe.exec(input);
-  if (match === null) {
-    throw new Error(`Invalid image: ${input}`);
-  }
-  const [all, imgType] = match;
-  if (!img.isValidType(imgType)) {
-    throw new Error(`Invalid format: ${input}`);
-  }
-  return img.fromFile(imgType, input.substring(all.length));
+interface OtherImage {
+  index: number;
+  filename: string;
+  geometry: MagickGeometry;
 }
 
-interface MainOptions {
-  background: img.MagickImage;
-  onion: string;
-  others: string[];
-  rangeX: RangeOptions;
-  rangeY: RangeOptions;
-  output: WritableStream<Uint8Array>;
-  outdir?: string;
+interface ScriptResult {
+  variables: Record<string, string>;
+  others: Map<number, OtherImage[]>;
 }
 
-async function parseArgs(args: string[]): Promise<MainOptions> {
-  const {
-    startx,
-    starty,
-    endx,
-    endy,
-    stepx,
-    stepy,
-    background: backgroundArg,
-    onion,
-    outfile,
-    outdir,
-    _: others,
-  } = cli
-    .parseArgs(args, {
-      string: [
-        "starty",
-        "endx",
-        "endy",
-        "stepx",
-        "stepy",
-        "background",
-        "onion",
-        "outfile",
-        "outdir",
-      ],
-    });
-  return {
-    background: await parseImage(
-      backgroundArg ?? "png:imgs/windows-xp-shrek.png",
-    ),
-    onion: onion ?? "imgs/onion-shrek-64x64.png",
-    others: others as string[],
-    rangeX: {
-      start: parseInt(startx as string) || 0,
-      end: parseInt(endx as string) || 1400,
-      step: parseInt(stepx as string) || 40,
-    },
-    rangeY: {
-      start: parseInt(starty as string) || 520,
-      end: parseInt(endy as string) || 740,
-      step: parseInt(stepy as string) || 40,
-    },
-    output: outfile === undefined
-      ? Deno.stdout.writable
-      : (await Deno.open(outfile, { create: true, write: true })).writable,
-    outdir,
-  };
-}
-
-interface TeeingPlantOptions {
-  it: AsyncGenerator<img.MagickImage>;
-  outdir: string;
-}
-
-async function writeImg(
-  input: img.MagickImage,
-  outpath: string,
-): Promise<void> {
-  const [jpg, outfile] = await Promise.all([
-    convert({ input, outputType: "jpg" }),
-    Deno.open(outpath, {
-      create: true,
-      write: true,
-    }),
-  ]);
-  await jpg.readable.pipeTo(outfile.writable);
-}
-
-async function* teeingPlant(
-  { outdir, it }: TeeingPlantOptions,
-): AsyncGenerator<img.MagickImage> {
-  await Deno.mkdir(outdir, { recursive: true });
-  let result: IteratorResult<img.MagickImage, img.MagickImage>;
-  let i = 0;
-  let writeTask: Promise<void>;
-  while (!(result = await it.next()).done) {
-    const miff = result.value;
-    writeTask = writeImg(miff, path.join(outdir, `${i++}.jpg`));
-    yield miff;
-    await writeTask;
+async function readScript(filename: string): Promise<ScriptResult> {
+  const varRe = /^\s*([A-Z][A-Z_]+)\s*=\s*/;
+  const otherRe = /^\s*(\d+)\.\s*/;
+  const variables = defaultRecord<string, string>("");
+  const others: Map<number, OtherImage[]> = new Map();
+  const infile = await Deno.open(filename);
+  const readable = infile.readable
+    .pipeThrough(new TextDecoderStream())
+    .pipeThrough(new TextLineStream());
+  for await (const line of readable) {
+    let match = varRe.exec(line);
+    if (match !== null) {
+      const [all, name] = match;
+      variables[name] = line.substring(all.length);
+      continue;
+    }
+    match = otherRe.exec(line);
+    if (match !== null) {
+      const [all, index] = match;
+      const key = parseInt(index);
+      const [filename, ...geometry] = line.substring(all.length)
+        .split(":", 5);
+      const [width, height, x, y] = geometry.map((v) => parseInt(v));
+      let array = others.get(parseInt(index));
+      if (array === undefined) {
+        array = [];
+        others.set(key, array);
+      }
+      array.push({
+        filename,
+        geometry: { width, height, x, y },
+        index: key,
+      });
+    }
   }
+  return { variables, others };
 }
 
-export async function main(args: string[]): Promise<number> {
-  const { background, onion, others, rangeX, rangeY, output, outdir } =
-    await parseArgs(
-      args,
-    );
-  let it = plant({ background, onion, rangeX, rangeY });
-  if (outdir !== undefined) {
-    it = teeingPlant({ outdir, it });
+function readRange(str: string): RangeOptions {
+  const values = str.split(":")
+    .map((v) => parseInt(v));
+  if (values.some((v) => isNaN(v) || v < 0)) {
+    throw new Error(`Invalid range: '${str}'`);
   }
-  let result = background;
-  for await (const p of it) {
-    result = p;
+  const [start, end, step] = values;
+  return { start, end, step };
+}
+
+function readOutputs(str: string): SetNumber.SetNumber {
+  if (str.length === 0) {
+    return SetNumber.allNumbers();
   }
-  for (const guess of others) {
-    result = await composite({
-      geometry: {
-        height: 360,
-        width: 360,
-        x: 890,
-        y: 0,
-      },
-      infiles: [guess],
-      input: result,
-      outputType: result.type,
-    });
+  const outputs = str.split(",")
+    .map((v) => parseInt(v))
+    .filter((v) => !isNaN(v));
+  return SetNumber.fromNumberArray(outputs);
+}
+
+export async function main([filename]: string[]): Promise<number> {
+  if (filename === undefined) {
+    console.error("Usage: %s INFILE", import.meta.filename ?? import.meta.url);
+    return 1;
   }
-  result = await convert({
-    input: result,
-    outputType: "jpg",
+  const { others, variables } = await readScript(filename);
+  const onion = variables["ONION"];
+  if (onion.length === 0) {
+    console.error("Need onion image");
+    return 1;
+  }
+  const rangeX = readRange(variables["RANGE_X"]);
+  const rangeY = readRange(variables["RANGE_Y"]);
+  const outdir = variables["OUTDIR"];
+  const outputs = readOutputs(variables["OUTPUTS"]);
+  const background = await img.fromScriptString(variables["BACKGROUND"]);
+  const it = plant({ background, onion, rangeX, rangeY });
+  const indexes = range({ start: 1 });
+  await Deno.mkdir(outdir, {
+    recursive: true,
   });
-  await result.readable.pipeTo(output);
+  for await (let r of it) {
+    const index = indexes.next().value as number;
+    const plus = others.get(index);
+    if (plus !== undefined) {
+      for (const { filename, geometry } of plus) {
+        r = await composite({
+          geometry: geometry,
+          infiles: [filename],
+          outputType: "miff",
+          input: r,
+        });
+      }
+    }
+    if (outputs.delete(index)) {
+      r = await convert({
+        input: r,
+        outputType: "jpg",
+      });
+      const outfile = await Deno.open(path.join(outdir, `${index}.jpg`), {
+        create: true,
+        write: true
+      });
+      await r.readable.pipeTo(outfile.writable);
+    }
+    if (outputs.empty) {
+      break;
+    }
+  }
   return 0;
 }
